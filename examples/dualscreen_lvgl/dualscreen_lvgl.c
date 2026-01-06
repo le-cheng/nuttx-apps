@@ -35,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <sys/boardctl.h>
 #include <nuttx/video/fb.h>
+#include <nuttx/wqueue.h>
 
 #include <lvgl/lvgl.h>
 #include <lvgl/src/drivers/nuttx/lv_nuttx_touchscreen.h>
@@ -62,6 +63,30 @@
  * Private Types
  ****************************************************************************/
 
+/* 模拟 DMA 2D 传输配置结构体
+ * 在真实硬件上，这些参数对应 DMA2D/PXP 等外设的寄存器配置
+ */
+typedef struct
+{
+  const void *src;        /* 源地址 */
+  void *dst;              /* 目的地址 */
+  uint32_t width;         /* 区域宽度 (像素) */
+  uint32_t height;        /* 区域高度 (行数) */
+  uint32_t src_stride;    /* 源缓冲区跨度 (字节) */
+  uint32_t dst_stride;    /* 目的缓冲区跨度 (字节) */
+  uint32_t bpp;           /* 每像素字节数 */
+} dma_2d_config_t;
+
+/* DMA 请求结构体 */
+
+typedef struct
+{
+  struct work_s work;
+  dma_2d_config_t cfg;
+  lv_display_t *disp;
+  bool notify;
+} dma_request_t;
+
 /* 双屏驱动数据结构 */
 
 typedef struct
@@ -76,6 +101,7 @@ typedef struct
   size_t fblen_right;             /* 右屏 framebuffer 大小 */
   void *draw_buf;                 /* LVGL 绘制缓冲区 */
   void *draw_buf2;                /* LVGL 第二绘制缓冲区(双缓冲) */
+  dma_request_t dma_req[2];       /* DMA 请求工作结构 */
 } dualscreen_ctx_t;
 
 /****************************************************************************
@@ -149,10 +175,63 @@ static int init_framebuffer(const char *path, int *fd, void **mem,
 }
 
 /****************************************************************************
+ * Name: dma_worker
+ *
+ * Description:
+ *   工作队列回调，执行实际的内存拷贝并通知完成
+ *
+ ****************************************************************************/
+
+static void dma_worker(FAR void *arg)
+{
+  dma_request_t *req = (dma_request_t *)arg;
+  const uint8_t *s = (const uint8_t *)req->cfg.src;
+  uint8_t *d = (uint8_t *)req->cfg.dst;
+  uint32_t line_bytes = req->cfg.width * req->cfg.bpp;
+  uint32_t h = req->cfg.height;
+
+  while (h--)
+    {
+      memcpy(d, s, line_bytes);
+      s += req->cfg.src_stride;
+      d += req->cfg.dst_stride;
+    }
+
+  if (req->notify && req->disp)
+    {
+      lv_display_flush_ready(req->disp);
+    }
+}
+
+/****************************************************************************
+ * Name: sim_dma_transfer_2d
+ *
+ * Description:
+ *   模拟 DMA 2D 传输操作。
+ *   使用工作队列模拟异步传输。
+ *
+ ****************************************************************************/
+
+static void sim_dma_transfer_2d(const dma_2d_config_t *cfg, lv_display_t *disp,
+                                bool notify, int req_idx)
+{
+  dualscreen_ctx_t *ctx = lv_display_get_driver_data(disp);
+  dma_request_t *req = &ctx->dma_req[req_idx];
+
+  /* 复制配置到请求结构 */
+  req->cfg = *cfg;
+  req->disp = disp;
+  req->notify = notify;
+
+  /* 提交到系统高优先级工作队列 */
+  work_queue(HPWORK, &req->work, dma_worker, req, 0);
+}
+
+/****************************************************************************
  * Name: dualscreen_flush_cb
  *
  * Description:
- *   自定义 flush 回调 - 将虚拟大屏数据分割到两个物理屏幕
+ *   自定义 flush 回调 - 使用模拟 DMA 接口进行分发
  *
  ****************************************************************************/
 
@@ -165,6 +244,13 @@ static void dualscreen_flush_cb(lv_display_t *disp, const lv_area_t *area,
   int32_t y1 = area->y1;
   int32_t x2 = area->x2;
   int32_t y2 = area->y2;
+  int32_t h = y2 - y1 + 1;
+
+  /* 源缓冲区（LVGL 绘制缓冲区）的跨度是固定的：虚拟屏幕宽度 * BPP */
+  uint32_t src_stride = VIRTUAL_WIDTH * BYTES_PER_PIXEL;
+
+  /* 检查是否需要更新右屏，用于决定左屏更新是否是最后一步 */
+  bool update_right = (x2 >= SCREEN_WIDTH);
 
   /* 处理左屏 (x: 0-959) */
 
@@ -174,35 +260,54 @@ static void dualscreen_flush_cb(lv_display_t *disp, const lv_area_t *area,
       int32_t left_x2 = (x2 < SCREEN_WIDTH) ? x2 : (SCREEN_WIDTH - 1);
       int32_t left_w = left_x2 - left_x1 + 1;
 
-      for (int32_t y = y1; y <= y2; y++)
-        {
-          uint8_t *src = color_p + (y * VIRTUAL_WIDTH + x1) * BYTES_PER_PIXEL;
-          uint8_t *dst = (uint8_t *)ctx->mem_left +
-                         y * ctx->stride_left + left_x1 * BYTES_PER_PIXEL;
-          memcpy(dst, src, left_w * BYTES_PER_PIXEL);
-        }
+      /* 配置模拟 DMA 传输参数 */
+      dma_2d_config_t dma_cfg;
+
+      /* 源地址：LVGL buffer 中的起始点 */
+      dma_cfg.src = color_p + (y1 * VIRTUAL_WIDTH + x1) * BYTES_PER_PIXEL;
+
+      /* 目的地址：左屏 Framebuffer 中的起始点 */
+      dma_cfg.dst = (uint8_t *)ctx->mem_left +
+                    y1 * ctx->stride_left + left_x1 * BYTES_PER_PIXEL;
+
+      dma_cfg.width = left_w;
+      dma_cfg.height = h;
+      dma_cfg.src_stride = src_stride;
+      dma_cfg.dst_stride = ctx->stride_left;
+      dma_cfg.bpp = BYTES_PER_PIXEL;
+
+      /* 启动传输 - 如果不更新右屏，则这是最后一步，需要通知 */
+      sim_dma_transfer_2d(&dma_cfg, disp, !update_right, 0);
     }
 
   /* 处理右屏 (x: 960-1919) */
 
-  if (x2 >= SCREEN_WIDTH)
+  if (update_right)
     {
       int32_t right_x1 = (x1 >= SCREEN_WIDTH) ? (x1 - SCREEN_WIDTH) : 0;
       int32_t right_x2 = x2 - SCREEN_WIDTH;
       int32_t right_w = right_x2 - right_x1 + 1;
       int32_t src_x1 = (x1 >= SCREEN_WIDTH) ? x1 : SCREEN_WIDTH;
 
-      for (int32_t y = y1; y <= y2; y++)
-        {
-          uint8_t *src = color_p +
-                         (y * VIRTUAL_WIDTH + src_x1) * BYTES_PER_PIXEL;
-          uint8_t *dst = (uint8_t *)ctx->mem_right +
-                         y * ctx->stride_right + right_x1 * BYTES_PER_PIXEL;
-          memcpy(dst, src, right_w * BYTES_PER_PIXEL);
-        }
-    }
+      /* 配置 DMA 传输参数 */
+      dma_2d_config_t dma_cfg;
 
-  lv_display_flush_ready(disp);
+      /* 源地址：LVGL buffer 中的起始点 (注意 src_x1 的计算) */
+      dma_cfg.src = color_p + (y1 * VIRTUAL_WIDTH + src_x1) * BYTES_PER_PIXEL;
+
+      /* 目的地址：右屏 Framebuffer 中的起始点 */
+      dma_cfg.dst = (uint8_t *)ctx->mem_right +
+                    y1 * ctx->stride_right + right_x1 * BYTES_PER_PIXEL;
+
+      dma_cfg.width = right_w;
+      dma_cfg.height = h;
+      dma_cfg.src_stride = src_stride;
+      dma_cfg.dst_stride = ctx->stride_right;
+      dma_cfg.bpp = BYTES_PER_PIXEL;
+
+      /* 启动传输 - 右屏总是最后一步（如果发生），需要通知 */
+      sim_dma_transfer_2d(&dma_cfg, disp, true, 1);
+    }
 }
 
 /****************************************************************************
@@ -218,7 +323,9 @@ static lv_display_t *create_dualscreen_display(void)
   dualscreen_ctx_t *ctx = &g_ctx;
   size_t buf_size;
 
-  /* 初始化左屏 /dev/fb0 */
+  /* 初始化左屏 /dev/fb0
+   * mem_left是显示屏物理地址
+  */
 
   if (init_framebuffer("/dev/fb0", &ctx->fd_left, &ctx->mem_left,
                        &ctx->stride_left, &ctx->fblen_left) < 0)

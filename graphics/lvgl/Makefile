@@ -58,7 +58,7 @@ WD := ${shell echo $(CURDIR) | sed -e 's/ /\\ /g'}
 
 CONFIG_GRAPH_LVGL_URL ?= "https://github.com/lvgl/lvgl/archive/refs/tags"
 
-LVGL_VERSION = 9.2.1
+LVGL_VERSION = 9.2.2
 LVGL_TARBALL = v$(LVGL_VERSION).zip
 
 LVGL_UNPACKNAME = lvgl
@@ -89,5 +89,5 @@ include $(APPDIR)/Application.mk
 ifeq ($(wildcard $(LVGL_UNPACKNAME)/.git),)
 distclean::
 	$(call DELDIR, $(LVGL_UNPACKNAME))
-	$(call DELFILE, $(LVGL_TARBALL))
+# 	$(call DELFILE, $(LVGL_TARBALL))
 endif
