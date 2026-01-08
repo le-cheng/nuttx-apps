@@ -1,5 +1,5 @@
 # ##############################################################################
-# apps/examples/dualscreen_lvgl/CMakeLists.txt
+# apps/examples/lvgldualscreen/CMakeLists.txt
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -20,19 +20,18 @@
 #
 # ##############################################################################
 
-if(CONFIG_EXAMPLES_DUALSCREEN_LVGL)
+if(CONFIG_EXAMPLES_LVGLDUALSCREEN)
   nuttx_add_application(
     NAME
-    dualscreen_lvgl
+    lvgldualscreen
     PRIORITY
-    ${CONFIG_EXAMPLES_DUALSCREEN_LVGL_PRIORITY}
+    ${CONFIG_EXAMPLES_LVGLDUALSCREEN_PRIORITY}
     STACKSIZE
-    ${CONFIG_EXAMPLES_DUALSCREEN_LVGL_STACKSIZE}
+    ${CONFIG_EXAMPLES_LVGLDUALSCREEN_STACKSIZE}
     MODULE
-    ${CONFIG_EXAMPLES_DUALSCREEN_LVGL}
+    ${CONFIG_EXAMPLES_LVGLDUALSCREEN}
     DEPENDS
     lvgl
     SRCS
-    dualscreen_lvgl.c)
+    lvgldualscreen.c)
 endif()
-

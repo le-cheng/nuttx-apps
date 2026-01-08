@@ -3,7 +3,7 @@
 # see the file kconfig-language.txt in the NuttX tools repository.
 #
 
-menuconfig EXAMPLES_DUALSCREEN_LVGL
+menuconfig EXAMPLES_LVGLDUALSCREEN
 	tristate "Dual Screen LVGL Demo"
 	default n
 	depends on GRAPHICS_LVGL
@@ -12,18 +12,17 @@ menuconfig EXAMPLES_DUALSCREEN_LVGL
 		This demo creates a 1920x720 virtual screen from two 960x720 physical
 		screens, using double buffering and DIRECT render mode.
 
-if EXAMPLES_DUALSCREEN_LVGL
+if EXAMPLES_LVGLDUALSCREEN
 
-config EXAMPLES_DUALSCREEN_LVGL_PRIORITY
-	int "dualscreen_lvgl task priority"
+config EXAMPLES_LVGLDUALSCREEN_PRIORITY
+	int "lvgldualscreen task priority"
 	default 100
 
-config EXAMPLES_DUALSCREEN_LVGL_STACKSIZE
-	int "dualscreen_lvgl stack size"
+config EXAMPLES_LVGLDUALSCREEN_STACKSIZE
+	int "lvgldualscreen stack size"
 	default 65536
 	---help---
 		Stack size for the dual screen LVGL application.
 		Larger stack is needed for virtual large screen buffer allocation.
 
-endif # EXAMPLES_DUALSCREEN_LVGL
-
+endif # EXAMPLES_LVGLDUALSCREEN

@@ -1,5 +1,5 @@
 /****************************************************************************
- * apps/examples/dualscreen_lvgl/dualscreen_lvgl.c
+ * apps/examples/lvgldualscreen/lvgldualscreen.c
  *
  * SPDX-License-Identifier: Apache-2.0
  *

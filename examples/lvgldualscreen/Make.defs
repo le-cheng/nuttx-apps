@@ -1,5 +1,5 @@
 ############################################################################
-# apps/examples/dualscreen_lvgl/Makefile
+# apps/examples/lvgldualscreen/Make.defs
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -20,16 +20,6 @@
 #
 ############################################################################
 
-include $(APPDIR)/Make.defs
-
-PROGNAME = dualscreen_lvgl
-PRIORITY = $(CONFIG_EXAMPLES_DUALSCREEN_LVGL_PRIORITY)
-STACKSIZE = $(CONFIG_EXAMPLES_DUALSCREEN_LVGL_STACKSIZE)
-MODULE = $(CONFIG_EXAMPLES_DUALSCREEN_LVGL)
-
-# Dual Screen LVGL Example
-
-MAINSRC = dualscreen_lvgl.c
-
-include $(APPDIR)/Application.mk
-
+ifneq ($(CONFIG_EXAMPLES_LVGLDUALSCREEN),)
+CONFIGURED_APPS += $(APPDIR)/examples/lvgldualscreen
+endif
