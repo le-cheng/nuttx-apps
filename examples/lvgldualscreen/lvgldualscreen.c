@@ -51,11 +51,27 @@
 #  define NEED_BOARDINIT 1
 #endif
 
-/* 屏幕配置 - 每个物理屏幕 960x720 */
-#define SCREEN_WIDTH      960
-#define SCREEN_HEIGHT     720
-#define VIRTUAL_WIDTH     (SCREEN_WIDTH * 2)  /* 1920 */
-#define VIRTUAL_HEIGHT    SCREEN_HEIGHT       /* 720 */
+/* 双屏模式控制宏
+ * 定义 CONFIG_EXAMPLES_LVGL_DUAL_SCREEN 启用双屏模式
+ * 未定义则使用单屏模式
+ */
+
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+/* 双屏配置 - 每个物理屏幕 960x720 */
+#  define SCREEN_WIDTH      960
+#  define SCREEN_HEIGHT     720
+#  define VIRTUAL_WIDTH     (SCREEN_WIDTH * 2)  /* 1920 */
+#  define VIRTUAL_HEIGHT    SCREEN_HEIGHT       /* 720 */
+#  define SCREEN_COUNT      2
+#else
+/* 单屏配置 */
+#  define SCREEN_WIDTH      960
+#  define SCREEN_HEIGHT     720
+#  define VIRTUAL_WIDTH     SCREEN_WIDTH        /* 960 */
+#  define VIRTUAL_HEIGHT    SCREEN_HEIGHT       /* 720 */
+#  define SCREEN_COUNT      1
+#endif
+
 #define COLOR_DEPTH       32
 #define BYTES_PER_PIXEL   (COLOR_DEPTH / 8)
 
@@ -87,21 +103,44 @@ typedef struct
   bool notify;
 } dma_request_t;
 
-/* 双屏驱动数据结构 */
+/* 显示驱动数据结构 */
 
 typedef struct
 {
-  int fd_left;                    /* 左屏 framebuffer 文件描述符 */
+  int fd_left;                    /* 左屏/主屏 framebuffer 文件描述符 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   int fd_right;                   /* 右屏 framebuffer 文件描述符 */
-  void *mem_left;                 /* 左屏内存映射 */
-  void *mem_right;                /* 右屏内存映射 */
-  uint32_t stride_left;           /* 左屏每行字节数 */
+#endif
+  void *mem_left;                 /* 左屏/主屏内存映射 buffer1 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  void *mem_right;                /* 右屏内存映射 buffer1 */
+#endif
+  void *mem_left2;                /* 左屏/主屏 buffer2 (双buffer模式) */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  void *mem_right2;               /* 右屏 buffer2 (双buffer模式) */
+#endif
+  uint32_t stride_left;           /* 左屏/主屏每行字节数 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   uint32_t stride_right;          /* 右屏每行字节数 */
-  size_t fblen_left;              /* 左屏 framebuffer 大小 */
+#endif
+  size_t fblen_left;              /* 左屏/主屏 framebuffer 大小 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   size_t fblen_right;             /* 右屏 framebuffer 大小 */
-  void *draw_buf;                 /* LVGL 绘制缓冲区 */
-  void *draw_buf2;                /* LVGL 第二绘制缓冲区(双缓冲) */
-  dma_request_t dma_req[2];       /* DMA 请求工作结构 */
+#endif
+  uint32_t mem_left2_yoffset;     /* 左屏 buffer2 的 y 偏移 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  uint32_t mem_right2_yoffset;    /* 右屏 buffer2 的 y 偏移 */
+#endif
+  struct fb_planeinfo_s pinfo_left;   /* 左屏 plane info */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  struct fb_planeinfo_s pinfo_right;  /* 右屏 plane info */
+#endif
+  bool double_buffer;             /* 是否启用硬件双buffer */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  void *draw_buf;                 /* LVGL 绘制缓冲区(仅双屏模式) */
+  void *draw_buf2;                /* LVGL 第二绘制缓冲区(仅双屏模式) */
+  dma_request_t dma_req[2];       /* DMA 请求工作结构(双屏) */
+#endif
 } dualscreen_ctx_t;
 
 /****************************************************************************
@@ -128,12 +167,15 @@ static uint32_t millis(void)
  * Name: init_framebuffer
  *
  * Description:
- *   打开并初始化单个 framebuffer
+ *   打开并初始化单个 framebuffer，支持硬件双buffer检测
  *
  ****************************************************************************/
 
 static int init_framebuffer(const char *path, int *fd, void **mem,
-                            uint32_t *stride, size_t *fblen)
+                            void **mem2, uint32_t *mem2_yoffset,
+                            uint32_t *stride, size_t *fblen,
+                            struct fb_planeinfo_s *pinfo_out,
+                            bool *double_buffer)
 {
   struct fb_videoinfo_s vinfo;
   struct fb_planeinfo_s pinfo;
@@ -159,6 +201,13 @@ static int init_framebuffer(const char *path, int *fd, void **mem,
       return -1;
     }
 
+  printf("%s VideoInfo: xres=%u yres=%u yres_virtual=%u\n",
+         path, vinfo.xres, vinfo.yres, pinfo.yres_virtual);
+
+  /* 检测硬件双buffer支持: 虚拟高度 = 物理高度 × 2 */
+
+  *double_buffer = (pinfo.yres_virtual == (vinfo.yres * 2));
+
   *mem = mmap(NULL, pinfo.fblen, PROT_READ | PROT_WRITE,
               MAP_SHARED | MAP_FILE, *fd, 0);
   if (*mem == MAP_FAILED)
@@ -170,6 +219,25 @@ static int init_framebuffer(const char *path, int *fd, void **mem,
 
   *stride = pinfo.stride;
   *fblen = pinfo.fblen;
+  *pinfo_out = pinfo;
+
+  /* 初始化双buffer参数 */
+
+  if (*double_buffer)
+    {
+      /* Buffer2 位于 buffer1 下方，偏移一个屏幕高度 */
+      *mem2_yoffset = vinfo.yres;
+      *mem2 = (uint8_t *)(*mem) + (*mem2_yoffset) * pinfo.stride;
+      printf("%s: Hardware double buffer detected\n", path);
+      printf("  Buffer1: %p (yoffset=0)\n", *mem);
+      printf("  Buffer2: %p (yoffset=%u)\n", *mem2, *mem2_yoffset);
+    }
+  else
+    {
+      *mem2 = NULL;
+      *mem2_yoffset = 0;
+      printf("%s: Single buffer mode\n", path);
+    }
 
   return 0;
 }
@@ -182,6 +250,7 @@ static int init_framebuffer(const char *path, int *fd, void **mem,
  *
  ****************************************************************************/
 
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
 static void dma_worker(FAR void *arg)
 {
   dma_request_t *req = (dma_request_t *)arg;
@@ -226,12 +295,15 @@ static void sim_dma_transfer_2d(const dma_2d_config_t *cfg, lv_display_t *disp,
   /* 提交到系统高优先级工作队列 */
   work_queue(HPWORK, &req->work, dma_worker, req, 0);
 }
+#endif
 
 /****************************************************************************
  * Name: dualscreen_flush_cb
  *
  * Description:
- *   自定义 flush 回调 - 使用模拟 DMA 接口进行分发
+ *   自定义 flush 回调 - 根据配置使用单屏或双屏模式
+ *   单屏模式：零拷贝 + 硬件双buffer切换
+ *   双屏模式：DMA传输到两个屏幕
  *
  ****************************************************************************/
 
@@ -240,6 +312,14 @@ static void dualscreen_flush_cb(lv_display_t *disp, const lv_area_t *area,
 {
   dualscreen_ctx_t *ctx = lv_display_get_driver_data(disp);
 
+  /* 检查是否是最后一次 flush（DIRECT模式可能分块刷新） */
+  if (!lv_display_flush_is_last(disp))
+    {
+      lv_display_flush_ready(disp);
+      return;
+    }
+
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   int32_t x1 = area->x1;
   int32_t y1 = area->y1;
   int32_t x2 = area->x2;
@@ -248,6 +328,8 @@ static void dualscreen_flush_cb(lv_display_t *disp, const lv_area_t *area,
 
   /* 源缓冲区（LVGL 绘制缓冲区）的跨度是固定的：虚拟屏幕宽度 * BPP */
   uint32_t src_stride = VIRTUAL_WIDTH * BYTES_PER_PIXEL;
+
+  /* 双屏模式：分发到两个物理屏幕 */
 
   /* 检查是否需要更新右屏，用于决定左屏更新是否是最后一步 */
   bool update_right = (x2 >= SCREEN_WIDTH);
@@ -308,42 +390,81 @@ static void dualscreen_flush_cb(lv_display_t *disp, const lv_area_t *area,
       /* 启动传输 - 右屏总是最后一步（如果发生），需要通知 */
       sim_dma_transfer_2d(&dma_cfg, disp, true, 1);
     }
+#else
+  /* 单屏模式：零拷贝 + 硬件双buffer切换 */
+
+  LV_UNUSED(area);
+  LV_UNUSED(color_p);
+
+  /* 如果支持硬件双buffer，切换显示缓冲区 */
+  if (ctx->double_buffer && ctx->mem_left2 != NULL)
+    {
+      /* 判断当前激活的绘制缓冲区，切换显示偏移 */
+      lv_draw_buf_t *buf_active = lv_display_get_buf_active(disp);
+
+      if (buf_active->data == (uint8_t *)ctx->mem_left)
+        {
+          ctx->pinfo_left.yoffset = 0;  /* 显示 buffer1 */
+        }
+      else
+        {
+          ctx->pinfo_left.yoffset = ctx->mem_left2_yoffset;  /* 显示 buffer2 */
+        }
+
+      /* 执行硬件缓冲区切换（原子操作，垂直消隐期完成） */
+      if (ioctl(ctx->fd_left, FBIOPAN_DISPLAY,
+                (unsigned long)((uintptr_t)&(ctx->pinfo_left))) < 0)
+        {
+          printf("Warning: FBIOPAN_DISPLAY failed: %d\n", errno);
+        }
+    }
+
+  lv_display_flush_ready(disp);
+#endif
 }
 
 /****************************************************************************
  * Name: create_dualscreen_display
  *
  * Description:
- *   创建双屏显示，使用双缓冲和 DIRECT 渲染模式
+ *   创建显示，根据配置使用单屏或双屏模式，支持硬件双缓冲检测
  *
  ****************************************************************************/
 
 static lv_display_t *create_dualscreen_display(void)
 {
   dualscreen_ctx_t *ctx = &g_ctx;
-  size_t buf_size;
 
-  /* 初始化左屏 /dev/fb0
-   * mem_left是显示屏物理地址
-  */
+  /* 初始化主屏 /dev/fb0，检测硬件双buffer支持 */
 
   if (init_framebuffer("/dev/fb0", &ctx->fd_left, &ctx->mem_left,
-                       &ctx->stride_left, &ctx->fblen_left) < 0)
+                       &ctx->mem_left2, &ctx->mem_left2_yoffset,
+                       &ctx->stride_left, &ctx->fblen_left,
+                       &ctx->pinfo_left, &ctx->double_buffer) < 0)
     {
       return NULL;
     }
 
-  /* 初始化右屏 /dev/fb1 */
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  size_t buf_size;
+  bool double_buffer_right;
+
+  /* 双屏模式：初始化右屏 /dev/fb1 */
 
   if (init_framebuffer("/dev/fb1", &ctx->fd_right, &ctx->mem_right,
-                       &ctx->stride_right, &ctx->fblen_right) < 0)
+                       &ctx->mem_right2, &ctx->mem_right2_yoffset,
+                       &ctx->stride_right, &ctx->fblen_right,
+                       &ctx->pinfo_right, &double_buffer_right) < 0)
     {
       munmap(ctx->mem_left, ctx->fblen_left);
       close(ctx->fd_left);
       return NULL;
     }
 
-  /* 分配 LVGL 绘制缓冲区 (虚拟大屏尺寸, 双缓冲) */
+  printf("Dual-screen mode enabled: 2x %dx%d = %dx%d virtual\n",
+         SCREEN_WIDTH, SCREEN_HEIGHT, VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
+
+  /* 双屏模式：分配独立的LVGL绘制缓冲区 (虚拟大屏尺寸, 双缓冲) */
 
   buf_size = VIRTUAL_WIDTH * VIRTUAL_HEIGHT * BYTES_PER_PIXEL;
   ctx->draw_buf = malloc(buf_size);
@@ -366,18 +487,37 @@ static lv_display_t *create_dualscreen_display(void)
       close(ctx->fd_right);
       return NULL;
     }
+#else
+  /* 单屏模式：根据硬件能力决定buffer策略 */
+  if (ctx->double_buffer)
+    {
+      printf("Single-screen mode with hardware double buffering\n");
+      printf("  Buffer1: %p\n", ctx->mem_left);
+      printf("  Buffer2: %p\n", ctx->mem_left2);
+    }
+  else
+    {
+      printf("Single-screen mode (single buffer)\n");
+      printf("Using framebuffer memory directly (zero-copy mode)\n");
+    }
+#endif
 
   /* 创建 LVGL 显示 */
 
   lv_display_t *disp = lv_display_create(VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
   if (!disp)
     {
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
       free(ctx->draw_buf);
       free(ctx->draw_buf2);
       munmap(ctx->mem_left, ctx->fblen_left);
       munmap(ctx->mem_right, ctx->fblen_right);
       close(ctx->fd_left);
       close(ctx->fd_right);
+#else
+      munmap(ctx->mem_left, ctx->fblen_left);
+      close(ctx->fd_left);
+#endif
       return NULL;
     }
 
@@ -386,10 +526,26 @@ static lv_display_t *create_dualscreen_display(void)
   lv_display_set_driver_data(disp, ctx);
   lv_display_set_flush_cb(disp, dualscreen_flush_cb);
 
-  /* 设置双缓冲和 DIRECT 渲染模式 */
-
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  /* 双屏模式：使用独立的绘制缓冲区和DIRECT渲染模式 */
   lv_display_set_buffers(disp, ctx->draw_buf, ctx->draw_buf2, buf_size,
                          LV_DISPLAY_RENDER_MODE_DIRECT);
+#else
+  /* 单屏模式：根据硬件能力选择buffer策略 */
+  if (ctx->double_buffer && ctx->mem_left2 != NULL)
+    {
+      /* 硬件双buffer：使用两个framebuffer作为绘制缓冲区 */
+      lv_display_set_buffers(disp, ctx->mem_left, ctx->mem_left2,
+                             ctx->fblen_left / 2,
+                             LV_DISPLAY_RENDER_MODE_DIRECT);
+    }
+  else
+    {
+      /* 单buffer：直接使用framebuffer（零拷贝） */
+      lv_display_set_buffers(disp, ctx->mem_left, NULL, ctx->fblen_left,
+                             LV_DISPLAY_RENDER_MODE_DIRECT);
+    }
+#endif
 
   return disp;
 }
@@ -398,7 +554,7 @@ static lv_display_t *create_dualscreen_display(void)
  * Name: destroy_dualscreen_display
  *
  * Description:
- *   清理双屏显示资源
+ *   清理显示资源
  *
  ****************************************************************************/
 
@@ -411,6 +567,8 @@ static void destroy_dualscreen_display(lv_display_t *disp)
       lv_display_delete(disp);
     }
 
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  /* 双屏模式：释放独立分配的绘制缓冲区 */
   if (ctx->draw_buf)
     {
       free(ctx->draw_buf);
@@ -422,6 +580,7 @@ static void destroy_dualscreen_display(lv_display_t *disp)
       free(ctx->draw_buf2);
       ctx->draw_buf2 = NULL;
     }
+#endif
 
   if (ctx->mem_left)
     {
@@ -429,11 +588,13 @@ static void destroy_dualscreen_display(lv_display_t *disp)
       ctx->mem_left = NULL;
     }
 
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   if (ctx->mem_right)
     {
       munmap(ctx->mem_right, ctx->fblen_right);
       ctx->mem_right = NULL;
     }
+#endif
 
   if (ctx->fd_left >= 0)
     {
@@ -441,18 +602,20 @@ static void destroy_dualscreen_display(lv_display_t *disp)
       ctx->fd_left = -1;
     }
 
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
   if (ctx->fd_right >= 0)
     {
       close(ctx->fd_right);
       ctx->fd_right = -1;
     }
+#endif
 }
 
 /****************************************************************************
  * Name: create_test_ui
  *
  * Description:
- *   创建测试 UI - 包含各种测试组件，跨越两个屏幕
+ *   创建测试 UI - 根据配置自动适配单屏或双屏布局
  *
  ****************************************************************************/
 
@@ -465,6 +628,9 @@ static void create_test_ui(void)
   lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), 0);
   lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0x16213e), 0);
   lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_HOR, 0);
+
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  /* ========== 双屏模式 UI ========== */
 
   /* ========== 标题 (跨越两屏中央) ========== */
 
@@ -738,6 +904,152 @@ static void create_test_ui(void)
   lv_label_set_text(right_info, "fb1: (1919,719)");
   lv_obj_set_style_text_color(right_info, lv_color_hex(0xFFE66D), 0);
   lv_obj_set_pos(right_info, 1780, 680);
+
+#else
+  /* ========== 单屏模式 UI ========== */
+
+  /* 标题 */
+
+  lv_obj_t *title = lv_label_create(scr);
+  lv_label_set_text(title, "LVGL Single Screen Demo");
+  lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+
+  /* 副标题 */
+
+  lv_obj_t *subtitle = lv_label_create(scr);
+  lv_label_set_text_fmt(subtitle,
+                    "%s | DIRECT Mode | 960x720",
+                    g_ctx.double_buffer ? "Double Buffer" : "Single Buffer");
+  lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
+  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 55);
+
+  /* 主面板 */
+
+  lv_obj_t *main_panel = lv_obj_create(scr);
+  lv_obj_set_size(main_panel, 600, 400);
+  lv_obj_align(main_panel, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_set_style_bg_color(main_panel, lv_color_hex(0x2d2d44), 0);
+  lv_obj_set_style_radius(main_panel, 15, 0);
+  lv_obj_set_style_border_width(main_panel, 2, 0);
+  lv_obj_set_style_border_color(main_panel, lv_color_hex(0x4ECDC4), 0);
+  lv_obj_set_scrollbar_mode(main_panel, LV_SCROLLBAR_MODE_OFF);
+
+  /* 按钮 1 */
+
+  lv_obj_t *btn1 = lv_button_create(main_panel);
+  lv_obj_set_size(btn1, 150, 50);
+  lv_obj_set_pos(btn1, 30, 30);
+  lv_obj_set_style_bg_color(btn1, lv_color_hex(0xFF6B6B), 0);
+  lv_obj_t *btn1_label = lv_label_create(btn1);
+  lv_label_set_text(btn1_label, "Button 1");
+  lv_obj_center(btn1_label);
+
+  /* 按钮 2 */
+
+  lv_obj_t *btn2 = lv_button_create(main_panel);
+  lv_obj_set_size(btn2, 150, 50);
+  lv_obj_set_pos(btn2, 220, 30);
+  lv_obj_set_style_bg_color(btn2, lv_color_hex(0x4ECDC4), 0);
+  lv_obj_t *btn2_label = lv_label_create(btn2);
+  lv_label_set_text(btn2_label, "Button 2");
+  lv_obj_center(btn2_label);
+
+  /* 按钮 3 */
+
+  lv_obj_t *btn3 = lv_button_create(main_panel);
+  lv_obj_set_size(btn3, 150, 50);
+  lv_obj_set_pos(btn3, 410, 30);
+  lv_obj_set_style_bg_color(btn3, lv_color_hex(0xFFE66D), 0);
+  lv_obj_t *btn3_label = lv_label_create(btn3);
+  lv_label_set_text(btn3_label, "Button 3");
+  lv_obj_center(btn3_label);
+
+  /* 滑块 */
+
+  lv_obj_t *slider1 = lv_slider_create(main_panel);
+  lv_obj_set_width(slider1, 530);
+  lv_obj_set_pos(slider1, 30, 110);
+  lv_slider_set_value(slider1, 60, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(slider1, lv_color_hex(0x444455), 0);
+  lv_obj_set_style_bg_color(slider1, lv_color_hex(0xFF6B6B), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(slider1, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+
+  lv_obj_t *slider1_label = lv_label_create(main_panel);
+  lv_label_set_text(slider1_label, "Slider: 60%");
+  lv_obj_set_style_text_color(slider1_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_pos(slider1_label, 30, 145);
+
+  /* 进度条 */
+
+  lv_obj_t *bar1 = lv_bar_create(main_panel);
+  lv_obj_set_size(bar1, 530, 25);
+  lv_obj_set_pos(bar1, 30, 190);
+  lv_bar_set_value(bar1, 75, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(bar1, lv_color_hex(0x444455), 0);
+  lv_obj_set_style_bg_color(bar1, lv_color_hex(0x4ECDC4), LV_PART_INDICATOR);
+
+  lv_obj_t *bar1_label = lv_label_create(main_panel);
+  lv_label_set_text(bar1_label, "Progress: 75%");
+  lv_obj_set_style_text_color(bar1_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_pos(bar1_label, 30, 225);
+
+  /* 圆弧 (Arc) */
+
+  lv_obj_t *arc1 = lv_arc_create(main_panel);
+  lv_obj_set_size(arc1, 100, 100);
+  lv_obj_set_pos(arc1, 50, 260);
+  lv_arc_set_value(arc1, 70);
+  lv_obj_set_style_arc_color(arc1, lv_color_hex(0x444455), 0);
+  lv_obj_set_style_arc_color(arc1, lv_color_hex(0xFFE66D), LV_PART_INDICATOR);
+
+  /* 开关 */
+
+  lv_obj_t *sw1 = lv_switch_create(main_panel);
+  lv_obj_set_pos(sw1, 200, 280);
+  lv_obj_add_state(sw1, LV_STATE_CHECKED);
+
+  lv_obj_t *sw1_label = lv_label_create(main_panel);
+  lv_label_set_text(sw1_label, "Switch: ON");
+  lv_obj_set_style_text_color(sw1_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_pos(sw1_label, 270, 285);
+
+  /* 复选框 */
+
+  lv_obj_t *cb1 = lv_checkbox_create(main_panel);
+  lv_checkbox_set_text(cb1, "Checkbox");
+  lv_obj_set_style_text_color(cb1, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_pos(cb1, 200, 320);
+  lv_obj_add_state(cb1, LV_STATE_CHECKED);
+
+  /* 下拉框 */
+
+  lv_obj_t *dd = lv_dropdown_create(main_panel);
+  lv_dropdown_set_options(dd, "Item 1\nItem 2\nItem 3\nItem 4");
+  lv_obj_set_size(dd, 150, 40);
+  lv_obj_set_pos(dd, 400, 270);
+  lv_obj_set_style_bg_color(dd, lv_color_hex(0x444455), 0);
+  lv_obj_set_style_text_color(dd, lv_color_hex(0xFFFFFF), 0);
+
+  /* 底部信息栏 */
+
+  lv_obj_t *footer = lv_label_create(scr);
+  lv_label_set_text_fmt(footer,
+    "Screen: 960x720 | Physical: 960x720 | "
+    "Mode: DIRECT | Buffer: %s",
+    g_ctx.double_buffer ? "Hardware Double" : "Single");
+  lv_obj_set_style_text_color(footer, lv_color_hex(0x666666), 0);
+  lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+  /* 角落坐标信息 */
+
+  lv_obj_t *corner_info = lv_label_create(scr);
+  lv_label_set_text(corner_info, "fb0: (0,0)-(959,719)");
+  lv_obj_set_style_text_color(corner_info, lv_color_hex(0x4ECDC4), 0);
+  lv_obj_set_pos(corner_info, 20, 680);
+
+#endif
 }
 
 /****************************************************************************
@@ -748,7 +1060,7 @@ static void create_test_ui(void)
  * Name: main
  *
  * Description:
- *   双屏 LVGL 演示程序入口
+ *   LVGL 演示程序入口 - 支持单屏和双屏模式
  *
  ****************************************************************************/
 
@@ -775,12 +1087,12 @@ int main(int argc, FAR char *argv[])
 
   lv_tick_set_cb(millis);
 
-  /* 创建双屏显示 */
+  /* 创建显示 */
 
   disp = create_dualscreen_display();
   if (!disp)
     {
-      printf("Failed to create dual screen display!\n");
+      printf("Failed to create display!\n");
       lv_deinit();
       return 1;
     }
@@ -794,10 +1106,13 @@ int main(int argc, FAR char *argv[])
     }
   else
     {
-      /* 关键：将输入设备显式关联到我们的虚拟大屏显示器 */
+      /* 关键：将输入设备显式关联到我们的显示器 */
 
       lv_indev_set_display(indev, disp);
     }
+
+#ifdef CONFIG_EXAMPLES_LVGL_DUAL_SCREEN
+  /* 双屏模式：尝试初始化第二个输入设备 */
 
   indev = lv_nuttx_touchscreen_create("/dev/input1");
   if (!indev)
@@ -808,6 +1123,7 @@ int main(int argc, FAR char *argv[])
     {
       lv_indev_set_display(indev, disp);
     }
+#endif
 
   /* 创建测试 UI */
 

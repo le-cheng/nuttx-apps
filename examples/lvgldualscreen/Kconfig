@@ -14,6 +14,19 @@ menuconfig EXAMPLES_LVGLDUALSCREEN
 
 if EXAMPLES_LVGLDUALSCREEN
 
+config EXAMPLES_LVGL_DUAL_SCREEN
+	bool "Enable dual screen mode"
+	default n
+	---help---
+		Enable dual screen display mode.
+		When enabled, the application creates a 1920x720 virtual screen
+		from two 960x720 physical screens (/dev/fb0 and /dev/fb1).
+		When disabled, the application runs in single screen mode with
+		a single 960x720 screen (/dev/fb0).
+		
+		The code automatically adapts the display logic and UI layout
+		based on this configuration option.
+
 config EXAMPLES_LVGLDUALSCREEN_PRIORITY
 	int "lvgldualscreen task priority"
 	default 100

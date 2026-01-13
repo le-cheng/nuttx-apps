@@ -88,6 +88,6 @@ include $(APPDIR)/Application.mk
 
 ifeq ($(wildcard $(LVGL_UNPACKNAME)/.git),)
 distclean::
-	$(call DELDIR, $(LVGL_UNPACKNAME))
+# 	$(call DELDIR, $(LVGL_UNPACKNAME))
 # 	$(call DELFILE, $(LVGL_TARBALL))
 endif
